@@ -1,0 +1,10 @@
+data/*.parquet
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+.streamlit/secrets.toml
+.env
+.DS_Store
