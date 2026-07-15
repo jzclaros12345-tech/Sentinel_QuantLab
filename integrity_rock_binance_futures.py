@@ -86,10 +86,14 @@ RAW_SCHEMA = pa.schema([
     pa.field("volume",              pa.float32()),
     pa.field("quote_vol",           pa.float32()),
     pa.field("taker_buy_quote_vol", pa.float32()),
+    # n_trades viene en la respuesta cruda de Binance (índice 8 del kline,
+    # ver docstring de fetch_klines_with_retry) pero _bars_to_df nunca lo
+    # tomaba — se agrega acá para que quede persistido desde ahora.
+    pa.field("trades",              pa.int64()),
 ])
 
 _OHLCV_COLS = ["timestamp", "open", "high", "low", "close",
-               "volume", "quote_vol", "taker_buy_quote_vol"]
+               "volume", "quote_vol", "taker_buy_quote_vol", "trades"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -166,6 +170,7 @@ def enforce_schema(df: pd.DataFrame) -> pd.DataFrame:
     for col in ("open", "high", "low", "close", "volume",
                 "quote_vol", "taker_buy_quote_vol"):
         df[col] = df[col].astype("float32")
+    df["trades"] = df["trades"].astype("int64")
     return df
 
 
@@ -179,6 +184,7 @@ def empty_ohlcv_df() -> pd.DataFrame:
         "volume":              "float32",
         "quote_vol":           "float32",
         "taker_buy_quote_vol": "float32",
+        "trades":              "int64",
     })
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -290,8 +296,10 @@ def _bars_to_df(bars: list[list]) -> pd.DataFrame:
     malformed = [b for b in bars if len(b) < 11]
     if malformed:
         log.warning("  %d barra(s) malformada(s) descartadas (len < 11)", len(malformed))
+    # b[8] = n_trades — viene siempre en la respuesta de Binance, antes se
+    # descartaba acá sin razón. Orden tiene que calzar con _OHLCV_COLS.
     rows = [
-        [b[0], b[1], b[2], b[3], b[4], b[5], b[7], b[10]]
+        [b[0], b[1], b[2], b[3], b[4], b[5], b[7], b[10], b[8]]
         for b in bars if len(b) >= 11
     ]
     if not rows:
@@ -300,16 +308,33 @@ def _bars_to_df(bars: list[list]) -> pd.DataFrame:
     return enforce_schema(df)
 
 
-def _checkpoint_append(df: pd.DataFrame, path: Path) -> None:
+def _checkpoint_append(df: pd.DataFrame, path: Path, fresh_rebuild: bool = False) -> None:
     """
     Agrega filas nuevas al parquet existente (o lo crea si no existe).
     Usa escritura atómica: .tmp → verify → os.replace.
     Solo se llama durante descarga larga cada CHECKPOINT_EVERY batches.
+
+    fresh_rebuild: True únicamente en el PRIMER checkpoint de una descarga
+    que ya arrancó decidida a reconstruir todo desde el anchor (existing_df
+    era None en update_asset_tf — por archivo ausente, corrupto, vacío o
+    con schema desactualizado). En ese caso cualquier archivo que siga
+    físicamente en disco es basura vieja que YA decidimos tirar más arriba
+    en el pipeline, así que se sobreescribe directo, sin intentar mergear
+    (evita el bug de "trades" viejo faltante → NaN → cast roto).
+
+    Fuera de ese caso (resumes/delta normales) un error acá NO se traga en
+    silencio: antes este except genérico sobreescribía con solo el batch
+    en memoria ante CUALQUIER falla de lectura/merge, lo que en una corrida
+    de resume real hubiera podido borrar meses de histórico acumulado sin
+    avisar. Mejor abortar fuerte y dejar el archivo previo intacto en disco.
     """
     if df.empty:
         return
 
-    if path.exists():
+    if path.exists() and fresh_rebuild:
+        log.info("💾  Checkpoint fresco (rebuild): descartando archivo previo en disco en vez de mergear — %s", path.name)
+        combined = enforce_schema(df.copy())
+    elif path.exists():
         try:
             existing = pd.read_parquet(path)
             combined = pd.concat([existing, df], ignore_index=True)
@@ -321,8 +346,13 @@ def _checkpoint_append(df: pd.DataFrame, path: Path) -> None:
             )
             combined = enforce_schema(combined)
         except Exception as exc:
-            log.warning("⚠️  Checkpoint: no se pudo leer existente (%s) — sobreescribiendo", exc)
-            combined = enforce_schema(df.copy())
+            log.error(
+                "❌  Checkpoint: %s no se pudo mergear con el existente (%s). "
+                "NO se sobreescribe a ciegas — el archivo previo en disco queda intacto. "
+                "Revisá manualmente antes de reintentar.",
+                path.name, exc,
+            )
+            raise
     else:
         combined = enforce_schema(df.copy())
 
@@ -355,6 +385,7 @@ def _download_range(
     show_bar:      bool          = True,
     last_known_ts: Optional[int] = None,
     checkpoint_path: Optional[Path] = None,
+    fresh_rebuild: bool = False,
 ) -> pd.DataFrame:
     """
     Descarga paginada de todas las velas cerradas desde since_ms.
@@ -363,6 +394,11 @@ def _download_range(
     - Cada CHECKPOINT_EVERY batches escribe al disco para no perder progreso
       en descargas largas (ej. BTC 1m desde 2023 = ~1746 batches).
     - checkpoint_path: si se provee, activa checkpointing incremental.
+    - fresh_rebuild: True cuando esta descarga arrancó sin histórico previo
+      válido (existing_df era None). Solo afecta al PRIMER checkpoint de la
+      sesión — le dice a _checkpoint_append que sobreescriba en vez de
+      mergear, porque cualquier archivo que siga en disco a esta altura es
+      basura vieja que ya decidimos descartar (no un histórico a preservar).
     """
     symbol = _binance_symbol(asset)
     step   = tf_to_ms(tf)
@@ -375,6 +411,7 @@ def _download_range(
     all_bars:   list[list] = []   # acumulador total
     cursor = since_ms
     batches_since_ckpt = 0
+    first_checkpoint = True
 
     pbar = (
         tqdm(total=total_batches, desc=label, unit="batch", leave=False)
@@ -413,7 +450,11 @@ def _download_range(
 
         # ── Checkpoint incremental ────────────────────────────────────────────
         if checkpoint_path is not None and batches_since_ckpt >= CHECKPOINT_EVERY:
-            _checkpoint_append(_bars_to_df(all_bars), checkpoint_path)
+            _checkpoint_append(
+                _bars_to_df(all_bars), checkpoint_path,
+                fresh_rebuild=(fresh_rebuild and first_checkpoint),
+            )
+            first_checkpoint = False
             all_bars.clear()   # el progreso está en disco — liberar RAM
             gc.collect()
             batches_since_ckpt = 0
@@ -681,6 +722,7 @@ def update_asset_tf(asset: str, tf: str) -> SyncStats:
         label=label,
         last_known_ts=last_known_ts,
         checkpoint_path=r_path,   # activa checkpoint cada CHECKPOINT_EVERY batches
+        fresh_rebuild=(existing_df is None),
     )
 
     # Refrescar live_cutoff después de la descarga
