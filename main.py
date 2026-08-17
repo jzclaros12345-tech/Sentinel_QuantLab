@@ -1,52 +1,26 @@
 #!/usr/bin/env python3
-"""
-SENTINEL LIVE TICKER v2.2 — Bug-Fixed & Optimized
-═══════════════════════════════════════════════════════════════════════════════
-Ticker puro en RAM con visualización TUI Textual.
-Sin Parquet, sin DB. Formato de renderizado original mantenido.
+"""Sentinel Live Ticker.
 
-Bugs corregidos vs v2.1
-────────────────────────
-BUG-1  symbol.split("/").lower() → AttributeError (lista no tiene .lower())
-       FIX → symbol.split("/")[0].lower()
-
-BUG-2  Widget ID con mayúsculas → query_one() nunca encontraba el panel
-       FIX → ID siempre en minúsculas: f"{base}-{tf}"  donde base = lower()
-
-BUG-3  notional usaba (H+L)/2 en lugar de (H+L+C)/3 (inconsistente con
-       el resto del sistema Sentinel)
-       FIX → typical_price = (h + l + c) / 3
-
-BUG-4  ccxt.binance + defaultType="future" → fallas esporádicas en perps
-       FIX → ccxt.binanceusdm directamente (igual que integrity_rock)
-
-BUG-5  bare except: continue silenciaba bugs reales y dificultaba debug
-       FIX → except Exception as e: log con self.notify o print
-
-Optimizaciones RAM (8 GB)
-──────────────────────────
-OPT-1  fetch_ohlcv limit=2 → tomamos solo la última vela cerrada (limit=2
-       garantiza obtener la vela -2 que ya cerró y no la viva -1 si el
-       exchange aún no la consolidó; tomamos índice [-2] del resultado)
-OPT-2  gather() con semáforo para no abrir 6 conexiones simultáneas
-OPT-3  loop del executor reutiliza el mismo exchange object (un solo socket)
-OPT-4  LOOKBACK_CANDLES ajustable; 500 velas × 6 pares = 3000 rows, ~1 MB
-═══════════════════════════════════════════════════════════════════════════════
+Dashboard TUI en RAM para velas vivas de Binance Futures. Consulta REST cada
+dos segundos, limita la concurrencia y calcula el nocional con Typical Price.
+Los umbrales históricos están precalculados en ``MANUAL_STATS`` y expresados
+en millones de USDT.
 """
 
 import asyncio
+import logging
 import os
 import subprocess
 import time
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Optional
 
 import ccxt
-import numpy as np
-# >>> ELIMINADO — import pandas (no requerido en v2.3 manual stats)
-# <<< ELIMINADO
 from textual.app import App, ComposeResult
 from textual.containers import Grid
+from textual import events
 from textual.widgets import Footer, Header, Static
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -65,37 +39,43 @@ SOUND_DEBOUNCE_S = 4.0
 
 # Máximo de requests simultáneos al exchange (evita 429)
 MAX_CONCURRENT_FETCH = 3
+MAX_BACKOFF_S = 60
 
-# [CAMBIO 1/3] — Agregados BTC 1m y ETH 1m al final de la lista
+LOGGER = logging.getLogger("sentinel")
+LOGGER.setLevel(logging.INFO)
+if not LOGGER.handlers:
+    handler = RotatingFileHandler(
+        Path(__file__).with_name("sentinel.log"), maxBytes=1_000_000, backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    ))
+    LOGGER.addHandler(handler)
+
 PAIRS = [
-    ("BTC/USDT:USDT", "1m"), ("BTC/USDT:USDT", "5m"),  ("BTC/USDT:USDT", "1h"),  ("BTC/USDT:USDT", "1d"),
-    ("ETH/USDT:USDT", "1m"), ("ETH/USDT:USDT", "5m"),  ("ETH/USDT:USDT", "1h"),  ("ETH/USDT:USDT", "1d"),
-      ]
+    ("BTC/USDT:USDT", "1m"), ("BTC/USDT:USDT", "1h"),
+    ("BTC/USDT:USDT", "4h"), ("BTC/USDT:USDT", "1d"),
+    ("ETH/USDT:USDT", "1m"), ("ETH/USDT:USDT", "1h"),
+    ("ETH/USDT:USDT", "4h"), ("ETH/USDT:USDT", "1d"),
+]
 
 # Se rellena en main() desde MANUAL_STATS antes de arrancar la TUI
 STATS_CONFIG: dict[str, dict] = {}
 
-# >>> AÑADIDO INICIO — Diccionario maestro de umbrales manuales (v2.3)
-#     Todos los valores en millones de USDT (M).
-#     Ajusta según tu análisis histórico con el visualizador Sentinel.
-_ZERO = {"media": 0.0, "mediana": 0.0, "p95": 0.0, "gamma": 0.0}
+_ZERO = {"media": 0.0, "mediana": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0}
 
-# [CAMBIO 2/3] — Agregadas entradas 1m para BTC y ETH en MANUAL_STATS
-#     Valores 1m razonables: gamma y p95 menores que 5m (velas más cortas
-#     acumulan menos volumen por intervalo).
+# Valores históricos de notional en millones de USDT, consolidados el 2026-08-17.
 MANUAL_STATS: dict[str, dict] = {
-    "BTC/USDT:USDT_1m": {"media": 10.58,    "mediana":  5.08,    "p95":  89.72,   "gamma":  36.55},
-    "BTC/USDT:USDT_5m": {"media": 53.07,    "mediana": 28.90,    "p95": 387.24,   "gamma": 175.25},
-    "BTC/USDT:USDT_1h": {"media": 636.86,   "mediana": 414.74,   "p95": 3420.52,  "gamma": 1909.38},
-    "BTC/USDT:USDT_4h": {"media": 800.0,    "mediana": 750.0,    "p95": 2200.0,   "gamma": 1640.0},
-    "BTC/USDT:USDT_1d": {"media": 15289.64, "mediana": 14128.15, "p95": 44987.93, "gamma": 31342.04},
-    "ETH/USDT:USDT_1m": {"media":  6.98,    "mediana":  3.20,    "p95":  60.60,   "gamma":  24.42},
-    "ETH/USDT:USDT_5m": {"media": 34.93,    "mediana": 18.21,    "p95": 264.97,   "gamma": 118.31},
-    "ETH/USDT:USDT_1h": {"media": 419.15,   "mediana": 262.0,    "p95": 2369.24,  "gamma": 1286.92},
-    "ETH/USDT:USDT_4h": {"media": 500.0,    "mediana": 470.0,    "p95": 7572.13,   "gamma": 4764.62},
-    "ETH/USDT:USDT_1d": {"media": 10062.35, "mediana": 8119.10,  "p95": 33459.18, "gamma": 24254.50},
+    "BTC/USDT:USDT_1m": {"media": 10.207, "mediana": 4.877, "p90": 22.079, "p95": 35.345, "p99": 87.226},
+    "BTC/USDT:USDT_1h": {"media": 612.382, "mediana": 397.818, "p90": 1309.125, "p95": 1860.946, "p99": 3354.743},
+    "BTC/USDT:USDT_4h": {"media": 2449.213, "mediana": 1787.127, "p90": 5068.413, "p95": 6626.766, "p99": 10344.709},
+    "BTC/USDT:USDT_1d": {"media": 14695.429, "mediana": 13292.940, "p90": 25191.381, "p95": 30358.655, "p99": 44915.347},
+    "ETH/USDT:USDT_1m": {"media": 6.810, "mediana": 3.121, "p90": 14.841, "p95": 23.835, "p99": 59.554},
+    "ETH/USDT:USDT_1h": {"media": 408.575, "mediana": 257.288, "p90": 888.069, "p95": 1247.956, "p99": 2297.289},
+    "ETH/USDT:USDT_4h": {"media": 1634.134, "mediana": 1158.426, "p90": 3417.237, "p95": 4607.204, "p99": 7342.577},
+    "ETH/USDT:USDT_1d": {"media": 9804.948, "mediana": 8096.360, "p90": 18981.933, "p95": 23749.249, "p99": 33444.057},
 }
-# <<< AÑADIDO FIN1
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -111,7 +91,7 @@ def make_widget_id(symbol: str, tf: str) -> str:
       FIX: tomar [0] primero, luego .lower()
     """
     base = symbol.split("/")[0].lower()   # 'btc'
-    return f"{base}-{tf}"                  # 'btc-5m'
+    return f"{base}-{tf}"                  # p. ej. 'btc-4h'
 
 
 def notional_vwap(h: float, l: float, c: float, v: float) -> float:
@@ -170,6 +150,27 @@ class VolumePanel(Static):
         self.tf                = tf
         self.stats             = stats
         self._last_notional:   Optional[float] = None
+        self._last_render_args: Optional[tuple] = None
+        self._error_message: Optional[str] = None
+        self.muted: bool = False
+
+    def _get_threshold_names(self) -> tuple[str, str]:
+        """Devuelve los nombres de los percentiles warning y critical."""
+        return ("p95", "p99") if self.tf == "1m" else ("p90", "p95")
+
+    def _get_thresholds(self) -> tuple[float, float]:
+        warn_name, crit_name = self._get_threshold_names()
+        return self.stats[warn_name], self.stats[crit_name]
+
+    def on_click(self, event: events.Click) -> None:
+        """Activa o desactiva el sonido para este panel, sin ocultar alertas."""
+        self.muted = not self.muted
+        if self._last_render_args:
+            self.update(self.render_panel(*self._last_render_args))
+        self.notify(
+            f"{self.symbol} {self.tf}: sonido {'silenciado' if self.muted else 'activado'}",
+            severity="information",
+        )
 
     # ── Renderizado (formato original intacto) ────────────────────────────────
     def render_panel(
@@ -182,12 +183,28 @@ class VolumePanel(Static):
         symbol = self.symbol
         tf     = self.tf
 
+        warn_name, crit_name = self._get_threshold_names()
+
+        def color_for(stat_name: str) -> str:
+            if stat_name == crit_name:
+                return "#ff0000"
+            if stat_name == warn_name:
+                return "#ffa500"
+            return "#00FF00"
+
+        mute_icon = "🔇" if self.muted else "🔔"
+        error_line = (
+            f" [b #FF0000]ERROR: {self._error_message}[/]\n"
+            if self._error_message else ""
+        )
         return (
             f"[#00FF00]========================================[/]\n"
-            f"  [b #00FF00]SENTINEL | {symbol} | {tf}[/]\n"
+            f"  [b #00FF00]SENTINEL | {symbol} | {tf} {mute_icon}[/]\n"
             f"[#00FF00]========================================[/]\n\n"
             f"STAT | μ: {stats['media']:.2f}M | P50: {stats['mediana']:.2f}M\n"
-            f"STAT | γ: {stats['gamma']:.2f}M | P95: {stats['p95']:.2f}M\n"
+            f"STAT | [{color_for('p90')}]P90: {stats['p90']:.2f}M[/] | "
+            f"[{color_for('p95')}]P95: {stats['p95']:.2f}M[/] | "
+            f"[{color_for('p99')}]P99: {stats['p99']:.2f}M[/]\n"
             f"[#00FF00]----------------------------------------[/]\n"
             f"LIVE | O:{o:>8.2f} H:{h:>8.2f}\n"
             f"LIVE | L:{l:>8.2f} C:{c:>8.2f}\n"
@@ -195,6 +212,7 @@ class VolumePanel(Static):
             f"[#00FF00]----------------------------------------[/]\n"
             f" [b #FFA500]NOCIONAL: [{notional:>8.2f}M USD][/] ({cumplimiento:>5.1f}%)\n"
             f" ESTADO  : [ {status:<10} ]  TS: {utc_now}\n"
+            f"{error_line}"
             f"[#00FF00]----------------------------------------[/]\n"
             f"[#00FF00]MONITOREO LIVE ACTIVO...[/]\n"
             f"[#00FF00]----------------------------------------[/]"
@@ -214,19 +232,24 @@ class VolumePanel(Static):
         # BUG-3 FIX: usar Typical Price (H+L+C)/3 en lugar de mid-price (H+L)/2
         notional = notional_vwap(h, l, c, v)
 
-        # Skip si no cambió (evita re-render innecesario)
+        # Al recuperarse de un error se limpia el aviso aunque el valor no cambie.
+        recovered = self._error_message is not None
+        self._error_message = None
+
+        # Skip si no cambió (evita re-render innecesario).
         if notional == self._last_notional:
+            if recovered and self._last_render_args:
+                self.update(self.render_panel(*self._last_render_args))
             return False, False
         self._last_notional = notional
 
-        p95   = self.stats["p95"]
-        gamma = self.stats["gamma"]
+        warn_th, crit_th = self._get_thresholds()
 
-        is_crit = notional >= p95
-        is_warn = (notional >= gamma) and not is_crit
+        is_crit = notional >= crit_th
+        is_warn = (notional >= warn_th) and not is_crit
 
         # Actualizar clase CSS para el borde del panel
-        self.remove_class("critical", "warning", "normal")
+        self.remove_class("critical", "warning", "normal", "error")
         if is_crit:
             self.add_class("critical")
         elif is_warn:
@@ -234,16 +257,29 @@ class VolumePanel(Static):
         else:
             self.add_class("normal")
 
-        cumplimiento = (notional / p95 * 100) if p95 > 0 else 0.0
+        cumplimiento = (notional / crit_th * 100) if crit_th > 0 else 0.0
         status       = "CRITICAL" if is_crit else ("WARNING" if is_warn else "OK")
         utc_now      = datetime.fromtimestamp(
             ts / 1_000, tz=timezone.utc
         ).strftime("%d/%m %H:%M:%S")
 
-        self.update(
-            self.render_panel(o, h, l, c, v, notional, cumplimiento, status, utc_now)
-        )
+        self._last_render_args = (o, h, l, c, v, notional, cumplimiento, status, utc_now)
+        self.update(self.render_panel(*self._last_render_args))
         return is_crit, is_warn
+
+    def show_error(self, message: str) -> None:
+        """Muestra el fallo sin borrar la última vela válida del panel."""
+        self._error_message = message[:90]
+        self.remove_class("critical", "warning", "normal")
+        self.add_class("error")
+        if self._last_render_args:
+            args = (*self._last_render_args[:7], "ERROR", self._last_render_args[8])
+            self.update(self.render_panel(*args))
+        else:
+            self.update(
+                f"[b #ff0000]SENTINEL | {self.symbol} | {self.tf}[/]\n"
+                f"ERROR: {self._error_message}"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -274,6 +310,10 @@ class SentinelApp(App):
         background: #1a1400;
         border: solid #ffa500;
     }
+    VolumePanel.error {
+        background: #1a0000;
+        border: double #ff0000;
+    }
     """
 
     # >>> MODIFICACIÓN INICIO — Live interval (era REFRESH_INTERVAL = 60)
@@ -285,9 +325,7 @@ class SentinelApp(App):
         with Grid(id="main-grid"):
             for symbol, tf in PAIRS:
                 wid   = make_widget_id(symbol, tf)
-                stats = STATS_CONFIG.get(f"{symbol}_{tf}", {
-                    "media": 0.0, "mediana": 0.0, "p95": 0.0, "gamma": 0.0
-                })
+                stats = STATS_CONFIG.get(f"{symbol}_{tf}", _ZERO)
                 yield VolumePanel(symbol, tf, stats, wid)
         yield Footer()
 
@@ -298,6 +336,8 @@ class SentinelApp(App):
         })
         self._audio = AudioManager()
         self._sem   = asyncio.Semaphore(MAX_CONCURRENT_FETCH)
+        self._failures: dict[tuple[str, str], int] = {}
+        self._retry_after: dict[tuple[str, str], float] = {}
         # >>> MODIFICACIÓN INICIO — subtitle fija, sin countdown
         self.sub_title = (
             f"LIVE  │  refresco cada {self.LIVE_INTERVAL}s  │  Pares: {len(PAIRS)}"
@@ -309,35 +349,51 @@ class SentinelApp(App):
     async def _update_loop(self) -> None:
         while True:
             try:
-                tasks   = [self._fetch_one(s, t) for s, t in PAIRS]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                now = time.monotonic()
+                due_pairs = [
+                    pair for pair in PAIRS if now >= self._retry_after.get(pair, 0.0)
+                ]
+                results = await asyncio.gather(
+                    *(self._fetch_one(symbol, tf) for symbol, tf in due_pairs)
+                )
 
                 any_crit = any_warn = False
 
-                for (symbol, tf), result in zip(PAIRS, results):
-                    if isinstance(result, Exception):
-                        self.notify(
-                            f"Fetch error {symbol} {tf}: {result}",
-                            severity="warning",
-                        )
-                        continue
-
-                    symbol_r, tf_r, data = result
+                for symbol_r, tf_r, data, error in results:
                     wid = make_widget_id(symbol_r, tf_r)
 
                     try:
                         panel = self.query_one(f"#{wid}", VolumePanel)
+                        pair = (symbol_r, tf_r)
+                        if error:
+                            failures = self._failures.get(pair, 0) + 1
+                            self._failures[pair] = failures
+                            delay = min(2 ** min(failures, 6), MAX_BACKOFF_S)
+                            self._retry_after[pair] = time.monotonic() + delay
+                            message = f"{error} (reintento en {delay}s)"
+                            panel.show_error(message)
+                            LOGGER.warning("Fetch %s %s: %s", symbol_r, tf_r, message)
+                            self.notify(
+                                f"Fetch error {symbol_r} {tf_r}: {error}",
+                                severity="warning",
+                            )
+                            continue
+
+                        self._failures.pop(pair, None)
+                        self._retry_after.pop(pair, None)
                         c, w  = panel.update_market_data(data)
-                        if c:
+                        if not panel.muted and c:
                             any_crit = True
-                        elif w:
+                        elif not panel.muted and w:
                             any_warn = True
                     except Exception as e:
+                        LOGGER.exception("Panel update %s", wid)
                         self.notify(f"Panel update {wid}: {e}", severity="warning")
 
                 self._audio.alert(any_crit, any_warn)
 
             except Exception as e:
+                LOGGER.exception("Update loop error")
                 self.notify(f"Update loop error: {e}", severity="error")
 
             # >>> MODIFICACIÓN INICIO — sleep corto para monitor live
@@ -347,7 +403,7 @@ class SentinelApp(App):
     # ── Fetch individual con semáforo ─────────────────────────────────────────
     async def _fetch_one(
         self, symbol: str, tf: str
-    ) -> tuple[str, str, list]:
+    ) -> tuple[str, str, list, Optional[str]]:
         """
         OPT-2: semáforo limita concurrencia y presión sobre la API.
         """
@@ -363,9 +419,13 @@ class SentinelApp(App):
                 )
                 row = ohlcv[-1] if ohlcv else []
                 # <<< MODIFICACIÓN FIN
-                return symbol, tf, row
+                return symbol, tf, row, None
+            except ccxt.ExchangeNotAvailable as e:
+                return symbol, tf, [], f"BLOQUEADO: {e}"
+            except ccxt.NetworkError as e:
+                return symbol, tf, [], f"RED: {e}"
             except Exception as e:
-                return symbol, tf, []   # panel mostrará datos anteriores
+                return symbol, tf, [], f"ERROR: {type(e).__name__}: {e}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -377,8 +437,7 @@ class SentinelApp(App):
 
 
 def main() -> None:
-    # >>> MODIFICADO INICIO — carga desde MANUAL_STATS, sin fetch histórico
-    print("📈 SENTINEL LIVE v2.3: Cargando umbrales manuales…")
+    print("📈 SENTINEL LIVE: Cargando umbrales manuales…")
 
     for symbol, tf in PAIRS:
         key   = f"{symbol}_{tf}"
@@ -391,13 +450,13 @@ def main() -> None:
             print(
                 f"  ✓  {symbol:<20} {tf:<4}  "
                 f"μ={stats['media']:.1f}M  "
-                f"γ={stats['gamma']:.1f}M  "
-                f"P95={stats['p95']:.1f}M"
+                f"P90={stats['p90']:.1f}M  "
+                f"P95={stats['p95']:.1f}M  "
+                f"P99={stats['p99']:.1f}M"
             )
 
     print("\n  Umbrales cargados. Arrancando TUI…\n")
     SentinelApp().run()
-    # <<< MODIFICADO FIN
 
 
 if __name__ == "__main__":

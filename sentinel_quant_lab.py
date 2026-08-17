@@ -572,12 +572,12 @@ def generate_reports_zip(selected_infos: list[dict], progress_cb=None) -> bytes:
                         })
                         summary_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
 
-                        curve_df = pd.DataFrame({
-                            f"x_{unit_col}": stats["x_grid"] / M,
-                            "densidad_kde": stats["pdf"],
-                        })
-                        curve_df.to_excel(writer, sheet_name=sheet_name, index=False,
-                                           startrow=len(summary_df) + 3)
+                        # Nota: se omite deliberadamente el detalle punto-a-punto de la
+                        # curva KDE (x_grid / pdf) en el reporte descargable. Ese detalle
+                        # granular no aporta valor de lectura; el resumen estadístico de
+                        # arriba (summary_df) es la "glosa final" que se necesita.
+                        # El PNG de abajo sigue mostrando la curva completa, por si se
+                        # necesita ver la forma de la distribución.
 
                         png_bytes = render_kde_image(
                             stats, window_cfg, window_label, filter_label, file_name
